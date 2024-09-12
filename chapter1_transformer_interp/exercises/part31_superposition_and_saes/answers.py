@@ -197,14 +197,14 @@ model = Model(
     importance=importance[None, :],
     feature_probability=feature_probability[:, None],
 )
-# model.optimize(steps=10_000)
+model.optimize(steps=10_000)
 
-# utils.plot_features_in_2d(
-#     model.W,
-#     colors=model.importance,
-#     title=f"Superposition: {cfg.n_features} features represented in 2D space",
-#     subplot_titles=[f"1 - S = {i:.3f}" for i in feature_probability.squeeze()],
-# )
+utils.plot_features_in_2d(
+    model.W,
+    colors=model.importance,
+    title=f"Superposition: {cfg.n_features} features represented in 2D space",
+    subplot_titles=[f"1 - S = {i:.3f}" for i in feature_probability.squeeze()],
+)
 # %%
 with t.inference_mode():
     batch = model.generate_batch(250)
@@ -228,15 +228,15 @@ model = Model(
     importance=importance[None, :],
     feature_probability=feature_probability[:, None],
 )
-# model.optimize(steps=10_000)
-# # %%
-# utils.plot_features_in_Nd(
-#     model.W,
-#     height=800,
-#     width=1600,
-#     title="ReLU output model: n_features = 80, d_hidden = 20, I<sub>i</sub> = 0.9<sup>i</sup>",
-#     subplot_titles=[f"Feature prob = {i:.3f}" for i in feature_probability],
-# )
+model.optimize(steps=10_000)
+# %%
+utils.plot_features_in_Nd(
+    model.W,
+    height=800,
+    width=1600,
+    title="ReLU output model: n_features = 80, d_hidden = 20, I<sub>i</sub> = 0.9<sup>i</sup>",
+    subplot_titles=[f"Feature prob = {i:.3f}" for i in feature_probability],
+)
 # %%
 
 class Model(nn.Module):
@@ -475,14 +475,14 @@ model = Model(
     importance=importance[None, :],
     feature_probability=feature_probability[:, None],
 )
-# model.optimize(steps=10_000)
+model.optimize(steps=10_000)
 
-# utils.plot_features_in_2d(
-#     model.W,
-#     colors=["blue"] * 2 + ["limegreen"] * 2 + ["red"] * 2,
-#     title="Correlated feature sets are represented in local orthogonal bases",
-#     subplot_titles=[f"1 - S = {i:.3f}" for i in feature_probability],
-# )
+utils.plot_features_in_2d(
+    model.W,
+    colors=["blue"] * 2 + ["limegreen"] * 2 + ["red"] * 2,
+    title="Correlated feature sets are represented in local orthogonal bases",
+    subplot_titles=[f"1 - S = {i:.3f}" for i in feature_probability],
+)
 # %%
 
 class NeuronModel(Model):
@@ -510,16 +510,16 @@ model = NeuronModel(
     importance=importance[None, :],
     feature_probability=feature_probability[:, None],
 )
-# model.optimize(steps=10_000)
+model.optimize(steps=10_000)
 
-# utils.plot_features_in_Nd(
-#     model.W,
-#     height=600,
-#     width=1000,
-#     title=f"Neuron model: {cfg.n_features=}, {cfg.d_hidden=}, I<sub>i</sub> = 0.75<sup>i</sup>",
-#     subplot_titles=[f"1 - S = {i:.2f}" for i in feature_probability.squeeze()],
-#     neuron_plot=True,
-# )
+utils.plot_features_in_Nd(
+    model.W,
+    height=600,
+    width=1000,
+    title=f"Neuron model: {cfg.n_features=}, {cfg.d_hidden=}, I<sub>i</sub> = 0.75<sup>i</sup>",
+    subplot_titles=[f"1 - S = {i:.2f}" for i in feature_probability.squeeze()],
+    neuron_plot=True,
+)
 # %%
 
 class NeuronComputationModel(Model):
@@ -818,7 +818,19 @@ class SAE(nn.Module):
             - Set new values of W_dec and W_enc to be these normalized vectors, at each dead neuron
             - Set b_enc to be zero, at each dead neuron
         """
-        raise NotImplementedError()
+        dead_latents_mask = (frac_active_in_window < 1e-8).all(dim=0)  # [instances d_sae]
+        n_dead = int(dead_latents_mask.int().sum().item())
+
+        # Get our random replacement values of shape [n_dead d_in], and scale them
+        replacement_values = t.randn((n_dead, self.cfg.d_in), device=self.W_enc.device)
+        replacement_values_normed = replacement_values / (
+            replacement_values.norm(dim=-1, keepdim=True) + self.cfg.weight_normalize_eps
+        )
+
+        # Change the corresponding values in W_enc, W_dec, and b_enc
+        self.W_enc.data.transpose(-1, -2)[dead_latents_mask] = resample_scale * replacement_values_normed
+        self.W_dec.data[dead_latents_mask] = replacement_values_normed
+        self.b_enc.data[dead_latents_mask] = 0.0
 
     @t.no_grad()
     def resample_advanced(
@@ -836,10 +848,127 @@ class SAE(nn.Module):
             - Set new values of W_dec and W_enc to be these (centered and normalized) vectors, at each dead neuron
             - Set b_enc to be zero, at each dead neuron
         """
-        raise NotImplementedError()
+        h = self.generate_batch(batch_size)
+        l2_loss = self.forward(h)[0]["L_reconstruction"]
 
+        for instance in range(self.cfg.n_inst):
+            # Find the dead latents in this instance. If all latents are alive, continue
+            is_dead = (frac_active_in_window[:, instance] < 1e-8).all(dim=0)
+            dead_latents = t.nonzero(is_dead).squeeze(-1)
+            n_dead = dead_latents.numel()
+            if n_dead == 0:
+                continue  # If we have no dead features, then we don't need to resample
+
+            # Compute L2 loss for each element in the batch
+            l2_loss_instance = l2_loss[:, instance]  # [batch_size]
+            if l2_loss_instance.max() < 1e-6:
+                continue  # If we have zero reconstruction loss, we don't need to resample
+
+            # Draw `d_sae` samples from [0, 1, ..., batch_size-1], with probabilities proportional to l2_loss
+            distn = Categorical(probs=l2_loss_instance.pow(2) / l2_loss_instance.pow(2).sum())
+            replacement_indices = distn.sample((n_dead,))  # type: ignore
+
+            # Index into the batch of hidden activations to get our replacement values
+            replacement_values = (h - self.b_dec)[replacement_indices, instance]  # [n_dead d_in]
+            replacement_values_normalized = replacement_values / (
+                replacement_values.norm(dim=-1, keepdim=True) + self.cfg.weight_normalize_eps
+            )
+
+            # Get the norm of alive neurons (or 1.0 if there are no alive neurons)
+            W_enc_norm_alive_mean = (
+                self.W_enc[instance, :, ~is_dead].norm(dim=0).mean().item()
+                if (~is_dead).any()
+                else 1.0
+            )
+
+            # Lastly, set the new weights & biases (W_dec is normalized, W_enc needs specific scaling, b_enc is zero)
+            self.W_dec.data[instance, dead_latents, :] = replacement_values_normalized
+            self.W_enc.data[instance, :, dead_latents] = (
+                replacement_values_normalized.T * W_enc_norm_alive_mean * resample_scale
+            )
+            self.b_enc.data[instance, dead_latents] = 0.0
+
+
+
+
+
+
+
+#%%
 tests.test_sae_init(SAE)
 tests.test_sae_W_dec_normalized(SAE)
 tests.test_sae_generate_batch(SAE)
 tests.test_sae_forward(SAE)
+#%%
+d_hidden = d_in = 2
+n_features = d_sae = 5
+n_inst = 8
+
+cfg = Config(n_inst=n_inst, n_features=n_features, d_hidden=d_hidden)
+
+model = Model(cfg=cfg, device=device)
+model.optimize(steps=10_000)
+
+sae = SAE(cfg=SAEConfig(n_inst=n_inst, d_in=d_in, d_sae=d_sae), model=model)
+
+h = sae.generate_batch(500)
+utils.plot_features_in_2d(model.W, title="Base model")
+utils.plot_features_in_2d(
+    einops.rearrange(h, "batch inst d_in -> inst d_in batch"),
+    title="Hidden state representation of a random batch of data",
+)
 # %%
+data_log = sae.optimize(steps=25_000)
+
+utils.animate_features_in_2d(
+    {
+        "Encoder weights": t.stack(data_log["W_enc"]),
+        "Decoder weights": t.stack(data_log["W_dec"]).transpose(-1, -2),
+    },
+    steps=data_log["steps"],
+    filename="animation-training.html",
+    title="SAE on toy model",
+)
+# %%
+utils.frac_active_line_plot(
+    frac_active=t.stack(data_log["frac_active"]),
+    title="Probability of sae features being active during training",
+    avg_window=10,
+)
+# %%
+tests.test_resample_simple(SAE)
+
+# %%
+sae = SAE(cfg=SAEConfig(n_inst=n_inst, d_in=d_in, d_sae=d_sae), model=model)
+
+data_log = sae.optimize(steps=25_000, resample_method="simple")
+
+utils.animate_features_in_2d(
+    {
+        "Encoder weights": t.stack(data_log["W_enc"]),
+        "Decoder weights": t.stack(data_log["W_dec"]).transpose(-1, -2),
+    },
+    steps=data_log["steps"],
+    filename="animation-resampling.html",
+    title="SAE on toy model with simple resampling",
+)
+# %%
+with t.inference_mode():
+    h_r = sae(h)[-1]
+
+utils.animate_features_in_2d(
+    {
+        "h": einops.rearrange(h, "batch inst d_in -> inst d_in batch"),
+        "h<sub>r</sub>": einops.rearrange(h_r, "batch inst d_in -> inst d_in batch"),
+    },
+    filename="animation-reconstructions.html",
+    title="Hidden state vs reconstructions",
+)
+# %%
+tests.test_resample_advanced(SAE)
+# %%
+# Train with overcomplete basis
+d_sae = 10
+sae = SAE(cfg=SAEConfig(n_inst=n_inst, d_in=d_in, d_sae=d_sae), model=model)
+
+data_log = sae.optimize(steps=25_000, resample_method="simple")
